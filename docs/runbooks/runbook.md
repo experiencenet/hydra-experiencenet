@@ -362,6 +362,88 @@ tccutil reset ScreenCapture com.experiencenet.hydraexperiencenet
 sqlite3 ~/Library/Application\ Support/com.apple.TCC/TCC.db "SELECT * FROM access WHERE service='kTCCServiceScreenCapture'"
 ```
 
+## Remote input (steering a head from the cluster)
+
+This fork can collect an input script from hydracluster and play it into the
+live stream, so that an operator or an agent drives an experience with nobody
+in front of the screen (issue 1184). It is the macOS and Linux equivalent of
+what hydraheadipad does through hydra-moonlight-ios (issues 1155 and 1159).
+
+### Why it lives here and not in the agent
+
+Synthetic input has to be sent from the process that owns the stream
+connection. hydraheadflatscreen launches this application and never holds the
+connection, so it cannot send a controller event at all. Posting operating
+system events at the window is not an alternative: SDL enumerates HID devices,
+so a posted event never becomes a gamepad, and on macOS it would also need an
+Accessibility grant that cannot be given over a wire.
+
+### Configuration
+
+Three environment variables, set by hydraheadflatscreen at launch:
+
+```
+HYDRA_REMOTE_INPUT_URL       the cluster base address
+HYDRA_REMOTE_INPUT_HEAD_ID   this head's identifier
+HYDRA_REMOTE_INPUT_TOKEN     this head's bearer token
+```
+
+**Never move these to the command line.** A command line is readable by every
+account on the machine through the process list and one of the three is a
+bearer token.
+
+With any of the three missing the poller does not start and the stream behaves
+exactly as before. That is the normal state for a head nobody steers, so it is
+logged at info level, not as a warning.
+
+### How a script reaches the host
+
+`HydraRemoteInput` (`app/streaming/input/hydraremoteinput.cpp`) runs on a
+thread of its own and polls `GET /api/v1/heads/{id}/input` every three seconds.
+It starts only once the connection is up, because a script collected before
+then would be played into nothing and lost.
+
+A gamepad step goes through `SdlInputHandler`'s virtual gamepad, which is a
+state held at player index 0 outside `m_GamepadState` so that the attach path
+can never hand its slot to a physical controller.
+
+**The merge is the point.** `sendGamepadStateLocked()` merges every source at
+player index 0 whenever the virtual gamepad is live, in multi controller mode
+as well as single. Without that, a script and a hand on a physical pad would
+sit on the same index and overwrite each other's event. Both reach the host
+together instead, exactly as they do on the iPad head.
+
+A keyboard step goes straight to the host through `LiSendUtf8TextEvent` or
+`LiSendKeyboardEvent`. A step may not mix the two, because one hold cannot
+mean two things.
+
+### The vocabulary is fixed in three places
+
+The fourteen button names, the key names and the modifier names are written
+down here, in hydra-moonlight-ios, and in hydracluster's validator. All three
+must agree, because a script that runs on one head must run on the other and
+because the virtual gamepad declares exactly these fourteen buttons when it
+arrives. If one list grows, all three grow.
+
+The arrow keys are deliberately not called up, down, left and right: those four
+names already mean the d-pad, and a shared name would quietly turn a keyboard
+step into a gamepad step.
+
+### Lifetime
+
+`SdlInputHandler` owns the poller, so one lifetime covers every way a stream
+can end. The destructor stops it first, before anything else is torn down, so
+that no button or key is left down on the host. Nothing else will ever lift one.
+
+### Not covered
+
+Mouse input. `moonlight-common-c` here is upstream and unforked, and the step
+model has no mouse field. Absolute mouse coordinates are also broken on every
+multi-slot body (issue 1182), so a mouse lane has to be relative only.
+
+Full test procedure lives in hydraheadflatscreen:
+`docs/testbooks/remote-input.md`.
+
 ## Integration with hydraheadflatscreen
 
 hydraheadflatscreen manages the lifecycle:

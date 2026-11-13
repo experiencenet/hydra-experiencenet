@@ -2158,6 +2158,11 @@ void Session::exec()
         return;
     }
 
+    // The connection is up in both modes from here, so a collected script has
+    // somewhere to go. Scene mode returns below without entering the SDL event
+    // loop, which is why this sits above the branch rather than inside it.
+    m_InputHandler->startRemoteInput();
+
     if (m_SceneMode) {
         // Scene mode: the Qt Quick scene graph renders the video inside
         // the existing kiosk window, so we create no SDL window and never

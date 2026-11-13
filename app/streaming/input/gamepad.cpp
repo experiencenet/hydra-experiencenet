@@ -5,6 +5,7 @@
 #include "settings/mappingmanager.h"
 
 #include <QtMath>
+#include <QMutexLocker>
 
 // How long the Start button must be pressed to toggle mouse emulation
 #define MOUSE_EMULATION_LONG_PRESS_TIME 750
@@ -53,6 +54,12 @@ SdlInputHandler::findStateForGamepad(SDL_JoystickID id)
 
 void SdlInputHandler::sendGamepadState(GamepadState* state)
 {
+    QMutexLocker locker(&m_GamepadLock);
+    sendGamepadStateLocked(state);
+}
+
+void SdlInputHandler::sendGamepadStateLocked(GamepadState* state)
+{
     SDL_assert(m_GamepadMask == 0x1 || m_MultiController);
 
     // Handle Select+PS as the clickpad button on PS4/5 controllers without a clickpad mapping
@@ -75,8 +82,15 @@ void SdlInputHandler::sendGamepadState(GamepadState* state)
     short rsX = state->rsX;
     short rsY = state->rsY;
 
-    // When in single controller mode, merge all gamepad state together
-    if (!m_MultiController) {
+    // When in single controller mode, merge all gamepad state together.
+    //
+    // The virtual gamepad forces the same merge for player index 0 even in
+    // multi controller mode. Without it a script and a physical pad would sit
+    // on the same index and overwrite each other's event, which is the one
+    // thing this lane must not do (issue 1184).
+    const bool mergeEverythingAtThisIndex =
+        !m_MultiController || (m_VirtualGamepadActive && state->index == 0);
+    if (mergeEverythingAtThisIndex) {
         for (int i = 0; i < MAX_GAMEPADS; i++) {
             if (m_GamepadState[i].index == state->index) {
                 buttons |= m_GamepadState[i].buttons;
@@ -101,6 +115,23 @@ void SdlInputHandler::sendGamepadState(GamepadState* state)
         }
     }
 
+    // The virtual gamepad lives outside m_GamepadState, so the loop above
+    // cannot see it. Fold it in here, unless it is itself the state being sent.
+    if (m_VirtualGamepadActive && state != &m_VirtualGamepadState &&
+        m_VirtualGamepadState.index == state->index) {
+        buttons |= m_VirtualGamepadState.buttons;
+        if (lt < m_VirtualGamepadState.lt) { lt = m_VirtualGamepadState.lt; }
+        if (rt < m_VirtualGamepadState.rt) { rt = m_VirtualGamepadState.rt; }
+        if (abs(lsX) < abs(m_VirtualGamepadState.lsX) || abs(lsY) < abs(m_VirtualGamepadState.lsY)) {
+            lsX = m_VirtualGamepadState.lsX;
+            lsY = m_VirtualGamepadState.lsY;
+        }
+        if (abs(rsX) < abs(m_VirtualGamepadState.rsX) || abs(rsY) < abs(m_VirtualGamepadState.rsY)) {
+            rsX = m_VirtualGamepadState.rsX;
+            rsY = m_VirtualGamepadState.rsY;
+        }
+    }
+
     LiSendMultiControllerEvent(state->index,
                                m_GamepadMask,
                                buttons,
@@ -110,6 +141,113 @@ void SdlInputHandler::sendGamepadState(GamepadState* state)
                                lsY,
                                rsX,
                                rsY);
+}
+
+// The virtual gamepad, issue 1184. It declares the same fourteen buttons the
+// iPad head's scripted pad declares, and the cluster validates a script against
+// the same fourteen names, so a script that runs on one head runs on the other.
+//
+// special, the paddles, the touchpad and the share button are NOT declared, so
+// a script cannot ask for a button the host was never told the pad has.
+static const uint32_t k_VirtualGamepadButtonFlags =
+    A_FLAG | B_FLAG | X_FLAG | Y_FLAG |
+    UP_FLAG | DOWN_FLAG | LEFT_FLAG | RIGHT_FLAG |
+    LB_FLAG | RB_FLAG |
+    PLAY_FLAG | BACK_FLAG |
+    LS_CLK_FLAG | RS_CLK_FLAG;
+
+bool SdlInputHandler::acquireVirtualGamepad()
+{
+    QMutexLocker locker(&m_GamepadLock);
+
+    if (m_VirtualGamepadActive) {
+        return true;
+    }
+
+    SDL_memset(&m_VirtualGamepadState, 0, sizeof(m_VirtualGamepadState));
+    m_VirtualGamepadState.index = 0;
+
+    // In single controller mode player 1 is always present, so the host already
+    // knows a controller is there and nothing needs announcing. In multi
+    // controller mode with no physical pad attached, player 1 is absent and the
+    // host would drop events for an index it was never told about.
+    if (m_MultiController && !(m_GamepadMask & 0x1)) {
+        m_GamepadMask |= 0x1;
+        m_VirtualGamepadAnnounced = true;
+
+#if SDL_VERSION_ATLEAST(2, 0, 14)
+        LiSendControllerArrivalEvent(0, m_GamepadMask, LI_CTYPE_XBOX,
+                                     k_VirtualGamepadButtonFlags, 0);
+#endif
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "Virtual gamepad announced as player 1");
+    }
+
+    m_VirtualGamepadActive = true;
+    return true;
+}
+
+void SdlInputHandler::setVirtualGamepadState(int buttons,
+                                             unsigned char leftTrigger, unsigned char rightTrigger,
+                                             short leftStickX, short leftStickY,
+                                             short rightStickX, short rightStickY)
+{
+    QMutexLocker locker(&m_GamepadLock);
+
+    if (!m_VirtualGamepadActive) {
+        return;
+    }
+
+    m_VirtualGamepadState.buttons = buttons;
+    m_VirtualGamepadState.lt = leftTrigger;
+    m_VirtualGamepadState.rt = rightTrigger;
+    m_VirtualGamepadState.lsX = leftStickX;
+    m_VirtualGamepadState.lsY = leftStickY;
+    m_VirtualGamepadState.rsX = rightStickX;
+    m_VirtualGamepadState.rsY = rightStickY;
+
+    sendGamepadStateLocked(&m_VirtualGamepadState);
+}
+
+void SdlInputHandler::setVirtualGamepadNeutral()
+{
+    setVirtualGamepadState(0, 0, 0, 0, 0, 0, 0);
+}
+
+void SdlInputHandler::releaseVirtualGamepad()
+{
+    QMutexLocker locker(&m_GamepadLock);
+
+    if (!m_VirtualGamepadActive) {
+        return;
+    }
+
+    SDL_memset(&m_VirtualGamepadState, 0, sizeof(m_VirtualGamepadState));
+    m_VirtualGamepadState.index = 0;
+    sendGamepadStateLocked(&m_VirtualGamepadState);
+
+    m_VirtualGamepadActive = false;
+
+    if (m_VirtualGamepadAnnounced) {
+        m_VirtualGamepadAnnounced = false;
+
+        // A physical pad may have attached at player 1 while the script was
+        // running. Taking the bit out then would tell the host that the pad in
+        // somebody's hands is gone.
+        bool physicalPadAtPlayerOne = false;
+        for (int i = 0; i < MAX_GAMEPADS; i++) {
+            if (m_GamepadState[i].controller != nullptr && m_GamepadState[i].index == 0) {
+                physicalPadAtPlayerOne = true;
+                break;
+            }
+        }
+
+        if (!physicalPadAtPlayerOne) {
+            m_GamepadMask &= ~0x1;
+            LiSendMultiControllerEvent(0, m_GamepadMask, 0, 0, 0, 0, 0, 0, 0);
+            SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION, "Virtual gamepad is gone");
+        }
+    }
 }
 
 void SdlInputHandler::sendGamepadBatteryState(GamepadState* state, SDL_JoystickPowerLevel level)

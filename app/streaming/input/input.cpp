@@ -4,6 +4,7 @@
 #include "settings/mappingmanager.h"
 #include "path.h"
 #include "utils.h"
+#include "hydraremoteinput.h"
 
 #include <QtGlobal>
 #include <QDir>
@@ -192,13 +193,37 @@ SdlInputHandler::SdlInputHandler(StreamingPreferences& prefs, int streamWidth, i
     m_GamepadMask = getAttachedGamepadMask();
 
     SDL_zero(m_GamepadState);
+    SDL_zero(m_VirtualGamepadState);
+    m_VirtualGamepadActive = false;
+    m_VirtualGamepadAnnounced = false;
+    m_RemoteInput = nullptr;
     SDL_zero(m_LastTouchDownEvent);
     SDL_zero(m_LastTouchUpEvent);
     SDL_zero(m_TouchDownEvent);
 }
 
+void SdlInputHandler::startRemoteInput()
+{
+    if (m_RemoteInput != nullptr) {
+        return;
+    }
+
+    m_RemoteInput = HydraRemoteInput::createFromEnvironment(this);
+    if (m_RemoteInput != nullptr) {
+        m_RemoteInput->start();
+    }
+}
+
 SdlInputHandler::~SdlInputHandler()
 {
+    // First, so that no script is still playing into a stream that is going
+    // away, and so that nothing is left held on the host.
+    if (m_RemoteInput != nullptr) {
+        m_RemoteInput->stop();
+        delete m_RemoteInput;
+        m_RemoteInput = nullptr;
+    }
+
     for (int i = 0; i < MAX_GAMEPADS; i++) {
         if (m_GamepadState[i].mouseEmulationTimer != 0) {
             Session::get()->notifyMouseEmulationMode(false);
