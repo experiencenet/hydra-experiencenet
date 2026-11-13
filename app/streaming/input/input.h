@@ -5,6 +5,8 @@
 
 #include "SDL_compat.h"
 
+#include <QMutex>
+
 struct GamepadState {
     SDL_GameController* controller;
     SDL_JoystickID jsId;
@@ -81,6 +83,8 @@ struct DualSenseOutputReport{
 #define GAMEPAD_HAPTIC_SIMPLE_HIFREQ_MOTOR_WEIGHT 0.33
 #define GAMEPAD_HAPTIC_SIMPLE_LOWFREQ_MOTOR_WEIGHT 0.8
 
+class HydraRemoteInput;
+
 class SdlInputHandler
 {
 public:
@@ -132,6 +136,32 @@ public:
 
     int getAttachedGamepadMask();
 
+    // The virtual gamepad lets the cluster steer this head (issue 1184). It is
+    // a gamepad slot that no physical device owns, held at player index 0 so
+    // that an experience reading only player 1 feels it, and merged with every
+    // physical pad at that index so that a script and a hand on a controller
+    // do not overwrite each other.
+    //
+    // These three are called from the remote input thread, so each one takes
+    // the gamepad lock. Returns false when there is no live connection to send
+    // to.
+    // Starts the remote input poller, if this head is configured for one.
+    // Called once the connection is up, because a script collected before
+    // then would be played into nothing and lost. Does nothing when the
+    // head is not configured, which is the normal case.
+    void startRemoteInput();
+
+    bool acquireVirtualGamepad();
+
+    void setVirtualGamepadState(int buttons,
+                                unsigned char leftTrigger, unsigned char rightTrigger,
+                                short leftStickX, short leftStickY,
+                                short rightStickX, short rightStickY);
+
+    void setVirtualGamepadNeutral();
+
+    void releaseVirtualGamepad();
+
     void raiseAllKeys();
 
     void notifyMouseLeave();
@@ -175,6 +205,10 @@ private:
 
     void sendGamepadState(GamepadState* state);
 
+    // Builds and sends one controller event for state->index, merging every
+    // other source at that index. The caller must already hold m_GamepadLock.
+    void sendGamepadStateLocked(GamepadState* state);
+
     void sendGamepadBatteryState(GamepadState* state, SDL_JoystickPowerLevel level);
 
     void handleAbsoluteFingerEvent(SDL_TouchFingerEvent* event);
@@ -216,6 +250,26 @@ private:
 
     int m_GamepadMask;
     GamepadState m_GamepadState[MAX_GAMEPADS];
+
+    // The virtual gamepad is kept outside m_GamepadState so that the attach
+    // path can never hand its slot to a physical controller. sendGamepadState()
+    // merges it in explicitly instead.
+    // Owned here so that one lifetime covers every way a stream ends. The
+    // session deletes this handler on each of them.
+    HydraRemoteInput* m_RemoteInput;
+
+    GamepadState m_VirtualGamepadState;
+    bool m_VirtualGamepadActive;
+
+    // True when acquiring the virtual gamepad was what put player index 0 into
+    // the gamepad mask, which is the case only in multi controller mode with no
+    // physical pad attached. Releasing then has to take the bit out again.
+    bool m_VirtualGamepadAnnounced;
+
+    // Guards every send and the virtual gamepad state. The SDL event loop and
+    // the remote input thread both reach sendGamepadState(), which reads every
+    // slot to build one event, so the merge needs a consistent view.
+    QMutex m_GamepadLock;
     QSet<short> m_KeysDown;
     bool m_FakeCaptureActive;
     QString m_OldIgnoreDevices;
