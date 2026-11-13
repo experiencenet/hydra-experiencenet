@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   build-macos:
-    runs-on: [self-hosted, macOS, ARM64, qt]
+    runs-on: [self-hosted, qt]
     env:
       CI_VERSION: ${{ github.sha }}
 
