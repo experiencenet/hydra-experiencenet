@@ -8,6 +8,7 @@ on:
     branches: [master]
   pull_request:
     branches: [master]
+  workflow_dispatch:
 
 concurrency:
   group: build-${{ github.ref }}
@@ -15,7 +16,7 @@ concurrency:
 
 jobs:
   build-macos:
-    runs-on: macos-15
+    runs-on: [self-hosted, macOS, ARM64, qt]
     env:
       CI_VERSION: ${{ github.sha }}
 
@@ -27,9 +28,23 @@ jobs:
           fetch-depth: 1
 
       - name: Install create-dmg
+        # The runner is self-hosted and the build user has no passwordless
+        # sudo, so Homebrew cannot be installed at /opt/homebrew and there is
+        # no `brew` to call. Node lives at ~/opt/node instead, reached through
+        # this runner's own .path file, which is scoped to this runner and
+        # cannot change the PATH any other job on that Mac inherits. That
+        # matters: the iPad release workflow on the same machine probes
+        # `which go` and downloads a pinned toolchain when it finds none, so a
+        # tool appearing on the shared user's PATH would silently change what
+        # a signed release builds with.
         run: |
-          brew install node
-          npm install --global create-dmg
+          if command -v brew >/dev/null 2>&1 && ! command -v node >/dev/null 2>&1; then
+            brew install node
+          fi
+          command -v node >/dev/null 2>&1 || { echo "::error::no node on PATH and no brew to install one"; exit 1; }
+          node --version
+          command -v create-dmg >/dev/null 2>&1 || npm install --global create-dmg
+          create-dmg --version 2>/dev/null | head -1 || true
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
