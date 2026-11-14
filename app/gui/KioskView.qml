@@ -20,6 +20,7 @@ Item {
     property string streamingExperience: ""
     property string errorMessage: ""
     property var statusPollTimer: null
+    property var gridPollTimer: null
     property bool helpVisible: false
     property string helpTab: "help"
     property var diagnosticsChecks: []
@@ -54,12 +55,18 @@ Item {
         }
 
         fetchConfig()
+
+        // The grid is showing, so watch for a stream prepared by the cluster
+        // rather than by a tap here (issue #1192). This also re-arms after a
+        // stream ends, because popping its page makes the grid current again.
+        startGridPoll()
     }
 
     StackView.onDeactivating: {
         if (kioskOverlayLoader.item !== null) {
             kioskOverlayLoader.item.visible = false
         }
+        stopGridPoll()
     }
 
     Loader {
@@ -266,10 +273,76 @@ Item {
         xhr.send(JSON.stringify(body))
     }
 
+    // Issue #1192: watch for a stream this kiosk did not start.
+    //
+    // pollStreamStatus below is armed only by the response to the
+    // stream/start THIS kiosk posted, so while the grid is showing nothing
+    // asks the agent anything. Every other way to prepare a stream reaches
+    // "ready" and then parks there forever, unseen:
+    //
+    //   POST /api/v1/heads/{id}/stream   on hydracluster (authenticated,
+    //                                    emits an event, shells out to
+    //                                    hydraheadflatscreen stream-start)
+    //   hydraheadflatscreen stream-start run on the head
+    //   POST /api/v1/stream/start        on the local API
+    //
+    // That is why the cluster's own route looked broken on Linux heads, and
+    // why the gap invited a synthetic pointer device on the head to click
+    // this grid instead. A pointer is the wrong tool for it: during a
+    // scene-mode stream, pointer input is forwarded to the BODY as touch
+    // (quickinput.cpp, LiSendTouchEvent with k_MousePointerId), so a pointer
+    // injector on a head is also a touch injector into the assigned body.
+    //
+    // Deliberately NOT the same timer as pollStreamStatus. That one also
+    // treats "idle" and "ready" as terminal back-to-grid for the subprocess
+    // platforms, so reusing it here would refetch the experience list every
+    // two seconds on macOS. This one answers one question and ignores
+    // everything else.
+    function startGridPoll() {
+        // Scene mode is Linux only. Elsewhere the agent spawns a subprocess
+        // and never emits "ready", so there is nothing to wait for.
+        if (Qt.platform.os !== "linux") {
+            return
+        }
+        stopGridPoll()
+        gridPollTimer = Qt.createQmlObject(
+            'import QtQuick 2.9; Timer { interval: 2000; repeat: true; running: true }',
+            kioskRoot, 'gridPollTimer')
+        gridPollTimer.triggered.connect(function() {
+            // A tap is already in flight and pollStreamStatus owns it.
+            if (streaming) {
+                return
+            }
+            fetchData("http://localhost:9740/api/v1/stream/status", function(data) {
+                if (data.status !== "ready") {
+                    return
+                }
+                // Stop before launching. A failed launch posts "error", which
+                // clears the agent's prepared parameters, so there is nothing
+                // left to retry; staying stopped means a launch that fails
+                // cannot become a two-second loop. Returning to the grid
+                // re-arms this through StackView.onActivated.
+                stopGridPoll()
+                streaming = true
+                streamingExperience = data.app ? data.app : ""
+                fetchParamsAndLaunch()
+            })
+        })
+    }
+
+    function stopGridPoll() {
+        if (gridPollTimer) {
+            gridPollTimer.running = false
+            gridPollTimer.destroy()
+            gridPollTimer = null
+        }
+    }
+
     // Issue #507 M4: the agent has run discovery and pairing and reports
     // "ready". Fetch the stream parameters it computed and launch the
-    // in-process scene-mode stream (Linux only; the call site is behind
-    // the Qt.platform.os gate in pollStreamStatus).
+    // in-process scene-mode stream. Linux only; both call sites are behind
+    // a Qt.platform.os gate, pollStreamStatus for a stream this kiosk
+    // started and startGridPoll for one prepared elsewhere (issue #1192).
     function fetchParamsAndLaunch() {
         var xhr = new XMLHttpRequest()
         xhr.onreadystatechange = function() {
@@ -335,6 +408,10 @@ Item {
     }
 
     function startStream(experienceName) {
+        // This tap owns the flow from here, and pollStreamStatus will watch
+        // it. Stop the grid watcher so both cannot answer the same "ready"
+        // and launch the stream twice (issue #1192).
+        stopGridPoll()
         streaming = true
         streamingExperience = experienceName
         errorMessage = ""

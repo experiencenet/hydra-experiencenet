@@ -504,6 +504,45 @@ Status as of 2026-08-20: M1 through M3 implemented, owner-validated on the omarc
 
 Body-side gotcha rediscovered during M3 acceptance: duplicate Virtual Display Driver instances on a body break absolute input injection (issue #428): taps land offset while drags work. Check Get-PnpDevice -Class Display on the body before debugging the head.
 
+### A tap is no longer the only way in (v6.2.1, issue #1192)
+
+The sentence above said "the tile tap streams IN PROCESS", and until v6.2.1 the
+tap was the only thing that could. `pollStreamStatus` was armed solely by the
+response to the `stream/start` the kiosk itself posted, so while the grid was
+showing nothing polled the agent at all. Everything else that prepares a stream
+reached `ready` and parked there forever, unseen:
+
+| How the stream was prepared | Before v6.2.1 | From v6.2.1 |
+|---|---|---|
+| Tap a tile on the grid | streams | streams |
+| `POST /api/v1/heads/{id}/stream` on hydracluster | parks at `ready` | streams |
+| `hydraheadflatscreen stream-start <experience>` | parks at `ready` | streams |
+| `POST /api/v1/stream/start` on the local API | parks at `ready` | streams |
+
+`startGridPoll` in `KioskView.qml` now runs while the grid is current and asks
+one question every two seconds: is the agent holding a prepared stream. On
+`ready` it stops itself, adopts the app name from the status and hands off to
+`fetchParamsAndLaunch`. `StackView.onActivated` arms it, which also re-arms it
+after a stream ends, because popping the stream page makes the grid current
+again. It is a second timer on purpose: `pollStreamStatus` also treats `idle`
+and `ready` as terminal back-to-grid for the subprocess platforms, so reusing
+it at the grid would refetch the experience list every two seconds on macOS.
+
+**The failure signature, if you meet it on an older kiosk:** status sits at
+`ready` indefinitely while `GET /api/v1/stream/params` answers 200 with the
+correct host and app. Nothing is wrong with the agent, the body or the network.
+Nothing is asking. Check the kiosk version first.
+
+**Do not work around it with a synthetic pointer on the head.** Pointer input
+during a scene-mode stream goes to the BODY as touch, per the paragraph above,
+so a pointer injector is also a touch injector into whichever body the cluster
+assigned, with none of the controls the head input queue carries. Use the
+cluster route to START a stream and the input queue to STEER one.
+
+**Tapping by hand needs TWO clicks.** A single click only hovers the tile and
+draws its focus outline, which looks exactly like a click that worked. This
+reads as wrong coordinates and is not.
+
 ## Waiting screen branding
 
 The flatscreen kiosk bundles the Samsung receiver's mark as
