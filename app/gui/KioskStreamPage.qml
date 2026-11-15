@@ -42,6 +42,58 @@ Item {
         xhr.send(JSON.stringify(body))
     }
 
+    // The in-process stop handshake (issue #1195). A stream started from
+    // the cluster could not be stopped from it. On this platform the stream
+    // runs in THIS process, so the agent has no process to kill and no way
+    // to call in: POST /api/v1/stream/stop set the agent's own status to
+    // idle, the session kept running, and the 15 second re-assert below put
+    // "streaming" back. The agent now parks the request on its status
+    // endpoint instead and this page collects it, which is the start
+    // handshake of issue #1192 run the other way round.
+    //
+    // session.stopSession() is the same call the exit overlay makes after
+    // the operator PIN. The PIN is there to stop a visitor ending somebody
+    // else's session from the panel. A stop arriving over the cluster's
+    // authenticated route is already authorised, and an unattended head has
+    // nobody to type a PIN, so this path must not raise that dialog.
+    property bool stopRequestSent: false
+
+    function pollStopRequest() {
+        // Once is enough. stopSession() needs time to quit the host app and
+        // tear the connection down, and calling it again part way through
+        // is not the same as calling it once.
+        if (stopRequestSent || terminalStatePosted || session === null) {
+            return
+        }
+        var xhr = new XMLHttpRequest()
+        xhr.onreadystatechange = function() {
+            if (xhr.readyState !== XMLHttpRequest.DONE || xhr.status !== 200) {
+                return
+            }
+            var data
+            try {
+                data = JSON.parse(xhr.responseText)
+            } catch (error) {
+                return
+            }
+            // An agent too old to know the field simply never asks, and the
+            // visitor keeps the exit overlay either way.
+            if (!data.stop_requested || stopRequestSent) {
+                return
+            }
+            stopRequestSent = true
+            stopRequestTimer.stop()
+            // Same veil the operator exit raises, so the panel shows the
+            // experience ending instead of a frozen last frame.
+            videoItem.streamActive = false
+            stageLabel.text = qsTr("Ending experience")
+            firstFrameSeen = false
+            session.stopSession()
+        }
+        xhr.open("GET", "http://127.0.0.1:9740/api/v1/stream/status")
+        xhr.send()
+    }
+
     function transitionStreamState(state, detail) {
         if (terminalStatePosted) {
             return
@@ -50,6 +102,7 @@ Item {
         if (state === "finished" || state === "error") {
             terminalStatePosted = true
             reassertTimer.stop()
+            stopRequestTimer.stop()
         }
         postStreamState(state, detail)
     }
@@ -121,6 +174,7 @@ Item {
         videoItem.focus = false
 
         reassertTimer.stop()
+        stopRequestTimer.stop()
 
         // Show the toolbar again when popped off the stack
         toolBar.visible = true
@@ -144,6 +198,9 @@ Item {
         // Agent-restart self-healing: re-assert the current state every
         // 15 seconds while this page is active.
         reassertTimer.start()
+
+        // Watch for a stop this kiosk did not start (issue #1195).
+        stopRequestTimer.start()
 
         // Ensure the SystemProperties async thread is finished,
         // since it may currently be using the SDL video subsystem
@@ -176,6 +233,16 @@ Item {
         interval: 15000
         repeat: true
         onTriggered: postStreamState(kioskStreamPage.streamState)
+    }
+
+    // Deliberately faster than the re-assert above. This one decides how
+    // long an operator waits for a remote stop, and the agent gives the
+    // kiosk 9 seconds to confirm before it reports the stop unconfirmed.
+    Timer {
+        id: stopRequestTimer
+        interval: 2000
+        repeat: true
+        onTriggered: kioskStreamPage.pollStopRequest()
     }
 
     // Dark backdrop behind the video so letterboxing and the loading
