@@ -543,6 +543,53 @@ cluster route to START a stream and the input queue to STEER one.
 draws its focus outline, which looks exactly like a click that worked. This
 reads as wrong coordinates and is not.
 
+### A stream can be ended from the cluster too (issue #1195)
+
+The other half of the route above. Starting a stream remotely was reachable
+from v6.2.1; ending one was not, on any kiosk version. On this platform the
+stream is a Session inside THIS process, so the agent has nothing to kill:
+`POST /api/v1/stream/stop` set the agent's own status to idle, the session kept
+running, and the stream page's 15 second re-assert put `streaming` back 15
+seconds later. The agent was not confused. The stop was.
+
+The handshake is the tap handshake of #1192 run the other way round, because
+the traffic between the two processes only runs one way:
+
+| Step | Who | What |
+|---|---|---|
+| 1 | agent | `POST /api/v1/stream/stop` parks a request, status STAYS `streaming` |
+| 2 | agent | `GET /api/v1/stream/status` reports `"stop_requested": true` |
+| 3 | kiosk | `stopRequestTimer` in `KioskStreamPage.qml` polls that every 2 s and calls `session.stopSession()` |
+| 4 | kiosk | `sessionFinished` posts the existing `finished` state |
+| 5 | agent | that push, and only that push, takes the status to `idle` |
+
+The status stays `streaming` for the whole handshake on purpose. It is the
+truth until the session really ends, and the re-assert then agrees with the
+agent instead of fighting it.
+
+**No operator PIN is raised.** `stopSession()` is the same call the exit
+overlay makes after the PIN prompt. The PIN exists to stop a visitor ending
+somebody else's session from the panel; a stop over the cluster's
+authenticated route is already authorised, and an unattended head has nobody
+to type one.
+
+**A stop can now answer three different things, and the difference matters:**
+
+| Answer | Meaning |
+|---|---|
+| `200 {"status":"idle"}` | the session ended and the agent saw it end |
+| `202 {"status":"streaming","stop_requested":true}` | asked, not finished within 9 s; read the status again before concluding anything |
+| `409` | refused, and `error` says by what (a local experience that would not save and close) |
+
+A 202 is not a failure. A big host app can take longer than 9 s to quit. Poll
+`GET /api/v1/stream/status` rather than stopping again: a second stop does not
+end the session any sooner, and an unanswered request expires by itself after
+60 seconds so it can never end the NEXT session.
+
+**On an older kiosk the agent reports 202 forever.** Nothing is polling the
+request. That is the honest answer and it is new: before this, the same head
+reported `idle` and kept streaming.
+
 ## Waiting screen branding
 
 The flatscreen kiosk bundles the Samsung receiver's mark as
